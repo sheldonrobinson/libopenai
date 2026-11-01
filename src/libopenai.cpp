@@ -1,64 +1,36 @@
 #include "libopenai/libopenai.hpp"
-#include <curl/curl.h>
-#include <openssl/ssl.h>
-#include <iostream>
+
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
 
 namespace libopenai {
 
-struct CurlGlobalInit {
-    CurlGlobalInit() { curl_global_init(CURL_GLOBAL_ALL); }
-    ~CurlGlobalInit() { curl_global_cleanup(); }
-};
-
-static CurlGlobalInit g_curl_init;
-
-struct WriteContext {
-    std::string* body;
-    std::ofstream* file;
-    Client::StreamCallback* stream_cb;
-};
-
-static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-    size_t total_size = size * nmemb;
-    auto* ctx = static_cast<WriteContext*>(userp);
-    std::string chunk(static_cast<char*>(contents), total_size);
-
-    if (ctx->body) {
-        *(ctx->body) += chunk;
-    }
-    if (ctx->file && ctx->file->is_open()) {
-        ctx->file->write(static_cast<char*>(contents), total_size);
-    }
-    if (ctx->stream_cb && *ctx->stream_cb) {
-        if (!(*ctx->stream_cb)(chunk)) {
-            return 0; // Abort transfer if callback returns false
-        }
-    }
-    return total_size;
-}
-
-static size_t HeaderCallback(char* buffer, size_t size, size_t nitems, void* userdata) {
-    size_t num_bytes = size * nitems;
-    std::string header(buffer, num_bytes);
-    std::string* req_id = static_cast<std::string*>(userdata);
-    if (header.rfind("x-request-id:", 0) == 0 || header.rfind("X-Request-Id:", 0) == 0) {
-        size_t colon = header.find(':');
-        if (colon != std::string::npos) {
-            std::string val = header.substr(colon + 1);
-            val.erase(0, val.find_first_not_of(" \t\r\n"));
-            val.erase(val.find_last_not_of(" \t\r\n") + 1);
-            *req_id = val;
-        }
-    }
-    return num_bytes;
-}
-
-Client::Client(const std::string& api_key, const std::string& base_url)
-    : api_key_(api_key), base_url_(base_url) {
+Client::Client(const std::string& api_key, const std::string& base_url, std::shared_ptr<ITransport> transport)
+    : api_key_(api_key), base_url_(base_url), transport_(transport) {
     if (api_key_.empty()) {
         if (const char* env_key = std::getenv("OPENAI_API_KEY")) {
             api_key_ = env_key;
         }
+    }
+    if (!transport_) {
+#if defined(LIBOPENAI_USE_NAMED_PIPE)
+        transport_ = CreateNamedPipeTransport("llama-openai-pipe");
+#elif defined(LIBOPENAI_USE_BEAST)
+        transport_ = CreateBeastTransport();
+#elif defined(LIBOPENAI_USE_WORKFLOW)
+        transport_ = CreateWorkflowTransport();
+#elif defined(LIBOPENAI_USE_CPPSERVER)
+        transport_ = CreateCppServerTransport();
+#elif defined(LIBOPENAI_USE_CURL)
+        transport_ = CreateCurlTransport();
+#elif defined(LIBOPENAI_USE_MONGOOSE)
+        transport_ = CreateMongooseTransport();
+#elif defined(LIBOPENAI_USE_CIVETWEB)
+        transport_ = CreateCivetwebTransport();
+#else
+        transport_ = CreateHttplibTransport();
+#endif
     }
 }
 
@@ -81,125 +53,43 @@ Response Client::ExecuteRequest(const std::string& method, const std::string& en
         l_stream_cb = stream_callback_;
     }
 
-    Response resp;
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        resp.status_code = -1;
-        resp.body = "Failed to initialize CURL";
-        return resp;
-    }
-
-    std::string url = l_base_url;
+    Request req;
+    req.method = method;
+    req.url = l_base_url;
     if (!endpoint.empty()) {
         if (l_base_url.back() != '/' && endpoint.front() != '/') {
-            url += "/" + endpoint;
+            req.url += "/" + endpoint;
         } else if (l_base_url.back() == '/' && endpoint.front() == '/') {
-            url += endpoint.substr(1);
+            req.url += endpoint.substr(1);
         } else {
-            url += endpoint;
+            req.url += endpoint;
         }
     }
+    req.endpoint = endpoint;
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, l_timeout);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-    if (!l_proxy.empty()) {
-        curl_easy_setopt(curl, CURLOPT_PROXY, l_proxy.c_str());
-    }
-
-    struct curl_slist* headers = nullptr;
     if (!l_api_key.empty()) {
-        headers = curl_slist_append(headers, ("Authorization: Bearer " + l_api_key).c_str());
+        req.headers["Authorization"] = "Bearer " + l_api_key;
     }
     if (!l_org.empty()) {
-        headers = curl_slist_append(headers, ("OpenAI-Organization: " + l_org).c_str());
+        req.headers["OpenAI-Organization"] = l_org;
     }
     if (!l_proj.empty()) {
-        headers = curl_slist_append(headers, ("OpenAI-Project: " + l_proj).c_str());
+        req.headers["OpenAI-Project"] = l_proj;
     }
     if (!l_req_id.empty()) {
-        headers = curl_slist_append(headers, ("X-Client-Request-Id: " + l_req_id).c_str());
+        req.headers["X-Client-Request-Id"] = l_req_id;
     }
 
-    std::ofstream outfile;
-    if (is_download) {
-        outfile.open(download_path, std::ios::binary);
-        if (!outfile.is_open()) {
-            curl_easy_cleanup(curl);
-            curl_slist_free_all(headers);
-            resp.status_code = -1;
-            resp.body = "Failed to open file for writing: " + download_path;
-            return resp;
-        }
-    }
+    req.payload = payload;
+    req.multipart_text = multipart_text;
+    req.multipart_files = multipart_files;
+    req.is_download = is_download;
+    req.download_path = download_path;
+    req.timeout_seconds = l_timeout;
+    req.proxy_url = l_proxy;
+    req.stream_callback = l_stream_cb;
 
-    WriteContext write_ctx{&resp.body, is_download ? &outfile : nullptr, l_stream_cb ? &l_stream_cb : nullptr};
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_ctx);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp.x_request_id);
-
-    curl_mime* mime = nullptr;
-
-    if (method == "GET") {
-        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-    } else if (method == "POST") {
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        if (!multipart_text.empty() || !multipart_files.empty()) {
-            mime = curl_mime_init(curl);
-            for (const auto& pair : multipart_text) {
-                curl_mimepart* part = curl_mime_addpart(mime);
-                curl_mime_name(part, pair.first.c_str());
-                curl_mime_data(part, pair.second.c_str(), CURL_ZERO_TERMINATED);
-            }
-            for (const auto& pair : multipart_files) {
-                curl_mimepart* part = curl_mime_addpart(mime);
-                curl_mime_name(part, pair.first.c_str());
-                curl_mime_filedata(part, pair.second.c_str());
-            }
-            curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
-        } else {
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)payload.size());
-        }
-    } else if (method == "DELETE") {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-    }
-
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        resp.status_code = -1;
-        resp.body = std::string("CURL error: ") + curl_easy_strerror(res);
-    } else {
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        resp.status_code = http_code;
-    }
-
-    if (mime) {
-        curl_mime_free(mime);
-    }
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    if (outfile.is_open()) {
-        outfile.close();
-    }
-
-    if (!resp.body.empty() && resp.status_code > 0) {
-        try {
-            resp.json_data = json::parse(resp.body);
-        } catch (...) {
-            // Not JSON or parse error, leave json_data empty/null
-        }
-    }
-
-    return resp;
+    return transport_->Execute(req);
 }
 
 Response Client::Get(const std::string& endpoint, const std::map<std::string, std::string>& query_params) {
@@ -233,7 +123,23 @@ bool Client::Download(const std::string& endpoint, const std::string& save_filep
     return !resp.is_error();
 }
 
-// --- Endpoints Implementation ---
+std::string Client::TransportName() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return transport_ ? transport_->Name() : "none";
+}
+
+// =====================================================================
+// Decisions
+// =====================================================================
+
+json Client::CreateDecision(const json& request_body) {
+    Response resp = Post("/decisions", request_body);
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+// =====================================================================
+// Chat Completions
+// =====================================================================
 
 json Client::ChatCompletion(const std::vector<Message>& messages, const std::string& model, int max_tokens, double temperature) {
     json body;
@@ -254,6 +160,10 @@ json Client::ChatCompletionCustom(const json& request_body) {
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
+// =====================================================================
+// Completions (Legacy)
+// =====================================================================
+
 json Client::Completion(const std::string& prompt, const std::string& model, int max_tokens) {
     json body;
     body["model"] = model;
@@ -268,73 +178,145 @@ json Client::CompletionCustom(const json& request_body) {
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
-json Client::CreateEmbeddings(const std::string& input, const std::string& model) {
+// =====================================================================
+// Embeddings
+// =====================================================================
+
+json Client::CreateEmbeddings(const std::string& input,
+                              const std::string& model,
+                              const std::optional<int>& dimensions,
+                              const std::optional<std::string>& encoding_format,
+                              const std::optional<std::string>& user) {
     json body;
     body["input"] = input;
     body["model"] = model;
+    if (dimensions.has_value()) body["dimensions"] = *dimensions;
+    if (encoding_format.has_value()) body["encoding_format"] = *encoding_format;
+    if (user.has_value()) body["user"] = *user;
     Response resp = Post("/embeddings", body);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
-json Client::CreateEmbeddingsBatch(const std::vector<std::string>& inputs, const std::string& model) {
+json Client::CreateEmbeddingsBatch(const std::vector<std::string>& inputs,
+                                   const std::string& model,
+                                   const std::optional<int>& dimensions,
+                                   const std::optional<std::string>& encoding_format,
+                                   const std::optional<std::string>& user) {
     json body;
     body["input"] = inputs;
     body["model"] = model;
+    if (dimensions.has_value()) body["dimensions"] = *dimensions;
+    if (encoding_format.has_value()) body["encoding_format"] = *encoding_format;
+    if (user.has_value()) body["user"] = *user;
     Response resp = Post("/embeddings", body);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
-bool Client::CreateSpeech(const std::string& input, const std::string& voice, const std::string& model, const std::string& save_filepath, const std::string& response_format) {
+// =====================================================================
+// Audio
+// =====================================================================
+
+bool Client::CreateSpeech(const std::string& input,
+                          const std::string& model,
+                          const std::optional<json>& voice,
+                          const std::optional<std::string>& instructions,
+                          const std::string& response_format,
+                          double speed,
+                          const std::string& save_filepath,
+                          const std::optional<std::string>& stream_format) {
     json body;
-    body["model"] = model;
     body["input"] = input;
-    body["voice"] = voice;
+    body["model"] = model;
+    if (voice.has_value()) body["voice"] = *voice;
+    if (instructions.has_value()) body["instructions"] = *instructions;
     body["response_format"] = response_format;
+    body["speed"] = speed;
+    if (stream_format.has_value()) body["stream_format"] = *stream_format;
+
     Response resp = ExecuteRequest("POST", "/audio/speech", body.dump(), {}, {}, true, save_filepath);
     return !resp.is_error();
 }
 
-json Client::CreateTranscription(const std::string& filepath, const std::string& model, const std::string& prompt, const std::string& language) {
+json Client::CreateTranscription(const std::string& filepath,
+                                 const std::string& model,
+                                 const std::optional<std::string>& prompt,
+                                 const std::optional<std::string>& language,
+                                 const std::optional<std::string>& response_format,
+                                 const std::optional<json>& chunking_strategy,
+                                 const std::optional<json>& include,
+                                 const std::optional<json>& keywords,
+                                 const std::optional<json>& known_speaker_names,
+                                 const std::optional<json>& known_speaker_references,
+                                 const std::optional<json>& languages,
+                                 const std::optional<bool>& stream,
+                                 double temperature,
+                                 const std::optional<json>& timestamp_granularities) {
     std::map<std::string, std::string> texts = {{"model", model}};
-    if (!prompt.empty()) texts["prompt"] = prompt;
-    if (!language.empty()) texts["language"] = language;
+    if (prompt.has_value()) texts["prompt"] = *prompt;
+    if (language.has_value()) texts["language"] = *language;
+    if (response_format.has_value()) texts["response_format"] = *response_format;
+    if (chunking_strategy.has_value()) texts["chunking_strategy"] = chunking_strategy->dump();
+    if (include.has_value()) texts["include"] = include->dump();
+    if (keywords.has_value()) texts["keywords"] = keywords->dump();
+    if (known_speaker_names.has_value()) texts["known_speaker_names"] = known_speaker_names->dump();
+    if (known_speaker_references.has_value()) texts["known_speaker_references"] = known_speaker_references->dump();
+    if (languages.has_value()) texts["languages"] = languages->dump();
+    if (stream.has_value()) texts["stream"] = *stream ? "true" : "false";
+    texts["temperature"] = std::to_string(temperature);
+    if (timestamp_granularities.has_value()) texts["timestamp_granularities"] = timestamp_granularities->dump();
+
     std::map<std::string, std::string> files = {{"file", filepath}};
     Response resp = PostMultipart("/audio/transcriptions", texts, files);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
-json Client::CreateTranslation(const std::string& filepath, const std::string& model, const std::string& prompt) {
+json Client::CreateTranslation(const std::string& filepath,
+                               const std::string& model,
+                               const std::optional<std::string>& prompt,
+                               const std::optional<std::string>& response_format,
+                               double temperature) {
     std::map<std::string, std::string> texts = {{"model", model}};
-    if (!prompt.empty()) texts["prompt"] = prompt;
+    if (prompt.has_value()) texts["prompt"] = *prompt;
+    if (response_format.has_value()) texts["response_format"] = *response_format;
+    texts["temperature"] = std::to_string(temperature);
     std::map<std::string, std::string> files = {{"file", filepath}};
     Response resp = PostMultipart("/audio/translations", texts, files);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
-json Client::CreateImage(const std::string& prompt, int n, const std::string& size, const std::string& model) {
-    json body;
-    body["prompt"] = prompt;
-    body["n"] = n;
-    body["size"] = size;
-    body["model"] = model;
-    Response resp = Post("/images/generations", body);
+// =====================================================================
+// Images
+// =====================================================================
+
+json Client::CreateImage(const json& request_body) {
+    Response resp = Post("/images/generations", request_body);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
-json Client::CreateImageEdit(const std::string& image_path, const std::string& prompt, const std::string& mask_path, int n, const std::string& size) {
-    std::map<std::string, std::string> texts = {{"prompt", prompt}, {"n", std::to_string(n)}, {"size", size}};
-    std::map<std::string, std::string> files = {{"image", image_path}};
-    if (!mask_path.empty()) files["mask"] = mask_path;
-    Response resp = PostMultipart("/images/edits", texts, files);
+json Client::CreateImageEdit(const json& request_body) {
+    Response resp = Post("/images/edits", request_body);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
-json Client::CreateImageVariation(const std::string& image_path, int n, const std::string& size) {
-    std::map<std::string, std::string> texts = {{"n", std::to_string(n)}, {"size", size}};
+json Client::CreateImageVariation(const std::string& image_path,
+                                  const std::optional<std::string>& model,
+                                  int n,
+                                  const std::optional<std::string>& response_format,
+                                  const std::optional<std::string>& size,
+                                  const std::optional<std::string>& user) {
+    std::map<std::string, std::string> texts = {{"n", std::to_string(n)}};
+    if (model.has_value()) texts["model"] = *model;
+    if (response_format.has_value()) texts["response_format"] = *response_format;
+    if (size.has_value()) texts["size"] = *size;
+    if (user.has_value()) texts["user"] = *user;
     std::map<std::string, std::string> files = {{"image", image_path}};
     Response resp = PostMultipart("/images/variations", texts, files);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
+
+// =====================================================================
+// Files
+// =====================================================================
 
 json Client::ListFiles() {
     Response resp = Get("/files");
@@ -361,6 +343,10 @@ json Client::RetrieveFile(const std::string& file_id) {
 bool Client::DownloadFileContent(const std::string& file_id, const std::string& save_filepath) {
     return Download("/files/" + file_id + "/content", save_filepath);
 }
+
+// =====================================================================
+// Fine-tuning
+// =====================================================================
 
 json Client::CreateFineTuningJob(const std::string& training_file_id, const std::string& model) {
     json body;
@@ -390,6 +376,10 @@ json Client::ListFineTuningEvents(const std::string& job_id) {
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
+// =====================================================================
+// Models
+// =====================================================================
+
 json Client::ListModels() {
     Response resp = Get("/models");
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
@@ -405,13 +395,26 @@ json Client::DeleteModel(const std::string& model_id) {
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
-json Client::CreateModeration(const std::string& input, const std::string& model) {
+// =====================================================================
+// Moderations
+// =====================================================================
+
+json Client::CreateModeration(const std::string& input, const std::optional<std::string>& model) {
     json body;
     body["input"] = input;
-    body["model"] = model;
+    if (model.has_value()) body["model"] = *model;
     Response resp = Post("/moderations", body);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
+
+json Client::CreateModeration(const json& request_body) {
+    Response resp = Post("/moderations", request_body);
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+// =====================================================================
+// Batches
+// =====================================================================
 
 json Client::CreateBatch(const std::string& input_file_id, const std::string& endpoint, const std::string& completion_window) {
     json body;
@@ -436,6 +439,10 @@ json Client::ListBatches() {
     Response resp = Get("/batches");
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
+
+// =====================================================================
+// Assistants, Threads, Messages, Runs (Beta API)
+// =====================================================================
 
 json Client::CreateAssistant(const std::string& model, const std::string& name, const std::string& instructions) {
     json body;
@@ -531,6 +538,324 @@ json Client::CancelRun(const std::string& thread_id, const std::string& run_id) 
 
 json Client::ListRuns(const std::string& thread_id) {
     Response resp = Get("/threads/" + thread_id + "/runs");
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+// =====================================================================
+// Realtime Translations
+// =====================================================================
+
+json Client::CreateRealtimeTranslationClientSecret(const json& request_body) {
+    Response resp = Post("/realtime/translations/client_secrets", request_body);
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+std::string Client::RealtimeTranslationWebSocketUrl(const std::string& model) const {
+    std::string l_base_url = base_url_;
+    std::string ws_url = l_base_url;
+    if (ws_url.rfind("https://", 0) == 0) {
+        ws_url = "wss://" + ws_url.substr(8);
+    } else if (ws_url.rfind("http://", 0) == 0) {
+        ws_url = "ws://" + ws_url.substr(7);
+    }
+    while (!ws_url.empty() && ws_url.back() == '/') {
+        ws_url.pop_back();
+    }
+    ws_url += "/realtime/translations?model=" + model;
+    return ws_url;
+}
+
+// =====================================================================
+// ExecuteRequestCustom - Custom base URL and headers (for Anthropic / System One)
+// =====================================================================
+
+Response Client::ExecuteRequestCustom(const std::string& base_url,
+                                      const std::string& method,
+                                      const std::string& endpoint,
+                                      const std::map<std::string, std::string>& extra_headers,
+                                      const std::string& payload,
+                                      const std::map<std::string, std::string>& multipart_text,
+                                      const std::map<std::string, std::string>& multipart_files,
+                                      bool is_download, const std::string& download_path) {
+    std::string l_base_url = base_url;
+    long l_timeout;
+    Client::StreamCallback l_stream_cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_timeout = timeout_seconds_;
+        l_stream_cb = stream_callback_;
+    }
+
+    Request req;
+    req.method = method;
+    req.url = l_base_url;
+    if (!endpoint.empty()) {
+        if (l_base_url.back() != '/' && endpoint.front() != '/') {
+            req.url += "/" + endpoint;
+        } else if (l_base_url.back() == '/' && endpoint.front() == '/') {
+            req.url += endpoint.substr(1);
+        } else {
+            req.url += endpoint;
+        }
+    }
+    req.endpoint = endpoint;
+
+    for (const auto& kv : extra_headers) {
+        req.headers[kv.first] = kv.second;
+    }
+
+    req.payload = payload;
+    req.multipart_text = multipart_text;
+    req.multipart_files = multipart_files;
+    req.is_download = is_download;
+    req.download_path = download_path;
+    req.timeout_seconds = l_timeout;
+    req.stream_callback = l_stream_cb;
+
+    return transport_->Execute(req);
+}
+
+// =====================================================================
+// Anthropic Messages API
+// =====================================================================
+
+json Client::CreateAnthropicMessage(const json& request_body) {
+    std::string l_anthropic_api_key, l_anthropic_base_url, l_anthropic_version;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_anthropic_api_key = anthropic_api_key_;
+        l_anthropic_base_url = anthropic_base_url_;
+        l_anthropic_version = anthropic_version_;
+    }
+
+    if (l_anthropic_api_key.empty()) {
+        if (const char* env_key = std::getenv("ANTHROPIC_API_KEY")) {
+            l_anthropic_api_key = env_key;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"x-api-key", l_anthropic_api_key},
+        {"anthropic-version", l_anthropic_version},
+        {"Content-Type", "application/json"}
+    };
+
+    Response resp = ExecuteRequestCustom(l_anthropic_base_url, "POST", "/v1/messages",
+                                         extra_headers, request_body.dump());
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+json Client::GetAnthropicMessage(const std::string& message_id) {
+    std::string l_anthropic_api_key, l_anthropic_base_url, l_anthropic_version;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_anthropic_api_key = anthropic_api_key_;
+        l_anthropic_base_url = anthropic_base_url_;
+        l_anthropic_version = anthropic_version_;
+    }
+
+    if (l_anthropic_api_key.empty()) {
+        if (const char* env_key = std::getenv("ANTHROPIC_API_KEY")) {
+            l_anthropic_api_key = env_key;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"x-api-key", l_anthropic_api_key},
+        {"anthropic-version", l_anthropic_version}
+    };
+
+    Response resp = ExecuteRequestCustom(l_anthropic_base_url, "GET",
+                                         "/v1/messages/" + message_id, extra_headers);
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+// =====================================================================
+// Anthropic Messages Batch API
+// =====================================================================
+
+json Client::CreateAnthropicBatch(const json& request_body) {
+    std::string l_anthropic_api_key, l_anthropic_base_url, l_anthropic_version;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_anthropic_api_key = anthropic_api_key_;
+        l_anthropic_base_url = anthropic_base_url_;
+        l_anthropic_version = anthropic_version_;
+    }
+
+    if (l_anthropic_api_key.empty()) {
+        if (const char* env_key = std::getenv("ANTHROPIC_API_KEY")) {
+            l_anthropic_api_key = env_key;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"x-api-key", l_anthropic_api_key},
+        {"anthropic-version", l_anthropic_version},
+        {"Content-Type", "application/json"}
+    };
+
+    Response resp = ExecuteRequestCustom(l_anthropic_base_url, "POST", "/v1/batches",
+                                         extra_headers, request_body.dump());
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+json Client::GetAnthropicBatch(const std::string& batch_id) {
+    std::string l_anthropic_api_key, l_anthropic_base_url, l_anthropic_version;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_anthropic_api_key = anthropic_api_key_;
+        l_anthropic_base_url = anthropic_base_url_;
+        l_anthropic_version = anthropic_version_;
+    }
+
+    if (l_anthropic_api_key.empty()) {
+        if (const char* env_key = std::getenv("ANTHROPIC_API_KEY")) {
+            l_anthropic_api_key = env_key;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"x-api-key", l_anthropic_api_key},
+        {"anthropic-version", l_anthropic_version}
+    };
+
+    Response resp = ExecuteRequestCustom(l_anthropic_base_url, "GET",
+                                         "/v1/batches/" + batch_id, extra_headers);
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+json Client::CancelAnthropicBatch(const std::string& batch_id) {
+    std::string l_anthropic_api_key, l_anthropic_base_url, l_anthropic_version;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_anthropic_api_key = anthropic_api_key_;
+        l_anthropic_base_url = anthropic_base_url_;
+        l_anthropic_version = anthropic_version_;
+    }
+
+    if (l_anthropic_api_key.empty()) {
+        if (const char* env_key = std::getenv("ANTHROPIC_API_KEY")) {
+            l_anthropic_api_key = env_key;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"x-api-key", l_anthropic_api_key},
+        {"anthropic-version", l_anthropic_version}
+    };
+
+    Response resp = ExecuteRequestCustom(l_anthropic_base_url, "DELETE",
+                                         "/v1/batches/" + batch_id, extra_headers);
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+json Client::ListAnthropicBatches(const std::map<std::string, std::string>& query_params) {
+    std::string l_anthropic_api_key, l_anthropic_base_url, l_anthropic_version;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_anthropic_api_key = anthropic_api_key_;
+        l_anthropic_base_url = anthropic_base_url_;
+        l_anthropic_version = anthropic_version_;
+    }
+
+    if (l_anthropic_api_key.empty()) {
+        if (const char* env_key = std::getenv("ANTHROPIC_API_KEY")) {
+            l_anthropic_api_key = env_key;
+        }
+    }
+
+    std::string endpoint = "/v1/batches";
+    if (!query_params.empty()) {
+        endpoint += "?";
+        bool first = true;
+        for (const auto& q : query_params) {
+            if (!first) endpoint += "&";
+            endpoint += q.first + "=" + q.second;
+            first = false;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"x-api-key", l_anthropic_api_key},
+        {"anthropic-version", l_anthropic_version}
+    };
+
+    Response resp = ExecuteRequestCustom(l_anthropic_base_url, "GET", endpoint, extra_headers);
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+// =====================================================================
+// Typesafe System One API
+// =====================================================================
+
+json Client::CreateSystemOneChatCompletion(const json& request_body) {
+    std::string l_system_one_api_key, l_system_one_base_url;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_system_one_api_key = system_one_api_key_;
+        l_system_one_base_url = system_one_base_url_;
+    }
+
+    if (l_system_one_api_key.empty()) {
+        if (const char* env_key = std::getenv("SYSTEM_ONE_API_KEY")) {
+            l_system_one_api_key = env_key;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"Authorization", "Bearer " + l_system_one_api_key},
+        {"Content-Type", "application/json"}
+    };
+
+    Response resp = ExecuteRequestCustom(l_system_one_base_url, "POST", "/v1/chat/completions",
+                                         extra_headers, request_body.dump());
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+json Client::ListSystemOneModels() {
+    std::string l_system_one_api_key, l_system_one_base_url;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_system_one_api_key = system_one_api_key_;
+        l_system_one_base_url = system_one_base_url_;
+    }
+
+    if (l_system_one_api_key.empty()) {
+        if (const char* env_key = std::getenv("SYSTEM_ONE_API_KEY")) {
+            l_system_one_api_key = env_key;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"Authorization", "Bearer " + l_system_one_api_key}
+    };
+
+    Response resp = ExecuteRequestCustom(l_system_one_base_url, "GET", "/v1/models", extra_headers);
+    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+}
+
+json Client::CreateSystemOneEmbeddings(const json& request_body) {
+    std::string l_system_one_api_key, l_system_one_base_url;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        l_system_one_api_key = system_one_api_key_;
+        l_system_one_base_url = system_one_base_url_;
+    }
+
+    if (l_system_one_api_key.empty()) {
+        if (const char* env_key = std::getenv("SYSTEM_ONE_API_KEY")) {
+            l_system_one_api_key = env_key;
+        }
+    }
+
+    std::map<std::string, std::string> extra_headers = {
+        {"Authorization", "Bearer " + l_system_one_api_key},
+        {"Content-Type", "application/json"}
+    };
+
+    Response resp = ExecuteRequestCustom(l_system_one_base_url, "POST", "/v1/embeddings",
+                                         extra_headers, request_body.dump());
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
