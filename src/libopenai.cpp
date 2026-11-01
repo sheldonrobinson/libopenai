@@ -137,6 +137,174 @@ json Client::CreateDecision(const json& request_body) {
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 
+DecisionResponse Client::CreateDecision(const DecisionRequest& req,
+                                        DecisionProvider provider) {
+    DecisionResponse result;
+
+    if (provider == DecisionProvider::OpenAI) {
+        // OpenAI Decisions: POST /v1/decisions
+        // (base_url_ already includes /v1, so endpoint is "/decisions")
+        json body;
+        body["model"] = req.model;
+        if (!req.input.text.empty()) {
+            body["input"] = req.input.text;
+        } else if (!req.input.json_data.is_null()) {
+            body["input"] = req.input.json_data;
+        }
+
+        json questions = json::array();
+        for (const auto& q : req.questions) {
+            json jq;
+            jq["name"] = q.name;
+            switch (q.type) {
+                case DecisionQuestionType::Predicate:
+                    jq["type"] = "predicate";
+                    jq["instructions"] = q.instructions;
+                    break;
+                case DecisionQuestionType::Choice: {
+                    jq["type"] = "choice";
+                    jq["instructions"] = q.instructions;
+                    json choices = json::array();
+                    for (const auto& c : q.choices) {
+                        choices.push_back({{"value", c.value}, {"description", c.description}});
+                    }
+                    jq["choices"] = choices;
+                    break;
+                }
+                case DecisionQuestionType::Score: {
+                    jq["type"] = "score";
+                    jq["instructions"] = q.instructions;
+                    json levels = json::array();
+                    for (const auto& l : q.levels) {
+                        levels.push_back({{"index", l.index}, {"label", l.label}, {"description", l.description}});
+                    }
+                    jq["levels"] = levels;
+                    break;
+                }
+            }
+            questions.push_back(jq);
+        }
+        body["questions"] = questions;
+
+        std::string l_base_url;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            l_base_url = base_url_;
+        }
+        std::map<std::string, std::string> extra_headers = {
+            {"Content-Type", "application/json"}
+        };
+        Response resp = ExecuteRequestCustom(l_base_url, "POST", "/decisions",
+                                             extra_headers, body.dump());
+
+        if (!resp.json_data.is_null() && resp.json_data.contains("answers")) {
+            for (const auto& a : resp.json_data["answers"]) {
+                DecisionAnswer ans;
+                ans.name = a.value("name", "");
+                ans.type = a.value("type", "");
+                if (a.contains("probability")) ans.probability = a["probability"].get<double>();
+                if (a.contains("choice")) ans.choice = a["choice"].get<std::string>();
+                if (a.contains("score")) ans.score = a["score"].get<double>();
+                if (a.contains("probabilities")) ans.probabilities = a["probabilities"];
+                if (a.contains("confidence")) ans.confidence = a["confidence"].get<double>();
+                result.answers.push_back(ans);
+            }
+        }
+        result.raw = resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+    } else {
+        // System One: POST /v1/systemone
+        json body;
+        body["model"] = req.model;
+        if (!req.input.text.empty()) {
+            body["input"] = req.input.text;
+        } else if (!req.input.json_data.is_null()) {
+            body["input"] = req.input.json_data;
+        }
+
+        json questions = json::array();
+        for (const auto& q : req.questions) {
+            json jq;
+            jq["name"] = q.name;
+            switch (q.type) {
+                case DecisionQuestionType::Predicate:
+                    jq["type"] = "predicate";
+                    jq["instructions"] = q.instructions;
+                    break;
+                case DecisionQuestionType::Choice: {
+                    jq["type"] = "choice";
+                    jq["instructions"] = q.instructions;
+                    json choices = json::array();
+                    for (const auto& c : q.choices) {
+                        choices.push_back({{"value", c.value}, {"description", c.description}});
+                    }
+                    jq["choices"] = choices;
+                    break;
+                }
+                case DecisionQuestionType::Score: {
+                    jq["type"] = "score";
+                    jq["instructions"] = q.instructions;
+                    json levels = json::array();
+                    for (const auto& l : q.levels) {
+                        levels.push_back({{"index", l.index}, {"label", l.label}, {"description", l.description}});
+                    }
+                    jq["levels"] = levels;
+                    break;
+                }
+            }
+            questions.push_back(jq);
+        }
+        body["questions"] = questions;
+
+        std::string l_system_one_api_key, l_system_one_base_url;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            l_system_one_api_key = system_one_api_key_;
+            l_system_one_base_url = system_one_base_url_;
+        }
+
+        if (l_system_one_api_key.empty()) {
+            if (const char* env_key = std::getenv("SYSTEM_ONE_API_KEY")) {
+                l_system_one_api_key = env_key;
+            }
+        }
+
+        std::map<std::string, std::string> extra_headers = {
+            {"Authorization", "Bearer " + l_system_one_api_key},
+            {"Content-Type", "application/json"}
+        };
+
+        Response resp = ExecuteRequestCustom(l_system_one_base_url, "POST", "/v1/systemone",
+                                             extra_headers, body.dump());
+
+        if (!resp.json_data.is_null()) {
+            if (resp.json_data.contains("answers")) {
+                for (const auto& a : resp.json_data["answers"]) {
+                    DecisionAnswer ans;
+                    ans.name = a.value("name", "");
+                    ans.type = a.value("type", "");
+                    if (a.contains("probability")) ans.probability = a["probability"].get<double>();
+                    if (a.contains("choice")) ans.choice = a["choice"].get<std::string>();
+                    if (a.contains("score")) ans.score = a["score"].get<double>();
+                    if (a.contains("probabilities")) ans.probabilities = a["probabilities"];
+                    if (a.contains("confidence")) ans.confidence = a["confidence"].get<double>();
+                    result.answers.push_back(ans);
+                }
+            } else {
+                DecisionAnswer ans;
+                ans.name = resp.json_data.value("name", "");
+                ans.type = resp.json_data.value("type", "");
+                if (resp.json_data.contains("probability")) ans.probability = resp.json_data["probability"].get<double>();
+                if (resp.json_data.contains("choice")) ans.choice = resp.json_data["choice"].get<std::string>();
+                if (resp.json_data.contains("score")) ans.score = resp.json_data["score"].get<double>();
+                result.answers.push_back(ans);
+            }
+        }
+        result.raw = resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
+    }
+
+    return result;
+}
+
 // =====================================================================
 // Chat Completions
 // =====================================================================
@@ -789,7 +957,7 @@ json Client::ListAnthropicBatches(const std::map<std::string, std::string>& quer
 // Typesafe System One API
 // =====================================================================
 
-json Client::CreateSystemOneChatCompletion(const json& request_body) {
+json Client::CreateSystemOneDecision(const json& request_body) {
     std::string l_system_one_api_key, l_system_one_base_url;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -808,7 +976,8 @@ json Client::CreateSystemOneChatCompletion(const json& request_body) {
         {"Content-Type", "application/json"}
     };
 
-    Response resp = ExecuteRequestCustom(l_system_one_base_url, "POST", "/v1/chat/completions",
+    // System One endpoint is POST /v1/systemone (not /v1/chat/completions).
+    Response resp = ExecuteRequestCustom(l_system_one_base_url, "POST", "/v1/systemone",
                                          extra_headers, request_body.dump());
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
@@ -832,30 +1001,6 @@ json Client::ListSystemOneModels() {
     };
 
     Response resp = ExecuteRequestCustom(l_system_one_base_url, "GET", "/v1/models", extra_headers);
-    return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
-}
-
-json Client::CreateSystemOneEmbeddings(const json& request_body) {
-    std::string l_system_one_api_key, l_system_one_base_url;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        l_system_one_api_key = system_one_api_key_;
-        l_system_one_base_url = system_one_base_url_;
-    }
-
-    if (l_system_one_api_key.empty()) {
-        if (const char* env_key = std::getenv("SYSTEM_ONE_API_KEY")) {
-            l_system_one_api_key = env_key;
-        }
-    }
-
-    std::map<std::string, std::string> extra_headers = {
-        {"Authorization", "Bearer " + l_system_one_api_key},
-        {"Content-Type", "application/json"}
-    };
-
-    Response resp = ExecuteRequestCustom(l_system_one_base_url, "POST", "/v1/embeddings",
-                                         extra_headers, request_body.dump());
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
 

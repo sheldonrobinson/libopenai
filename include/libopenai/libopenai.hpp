@@ -19,6 +19,61 @@
 
 namespace libopenai {
 
+// =====================================================================
+// Decision types (used by Client::CreateDecision)
+//   System One:  POST /v1/systemone   (TypeSafe, docs.typesafe.ai)
+//   OpenAI:      POST /v1/decisions   (developers.openai.com)
+// =====================================================================
+
+enum class DecisionQuestionType { Predicate, Choice, Score };
+
+struct DecisionChoiceOption {
+    std::string value;        // option value (choice questions)
+    std::string description;  // human-readable description
+};
+
+struct DecisionScoreLevel {
+    int index;                // level index (0-based, ordered low to high)
+    std::string label;        // human-readable label
+    std::string description;  // criteria for this level
+};
+
+struct DecisionQuestion {
+    std::string name;                              // unique id, echoed in response
+    DecisionQuestionType type;                     // predicate, choice, or score
+    std::string instructions;                      // question criteria
+    std::vector<DecisionChoiceOption> choices;     // for choice questions
+    std::vector<DecisionScoreLevel> levels;        // for score questions
+};
+
+struct DecisionInput {
+    std::string text;    // plain text evidence
+    json json_data;      // optional structured JSON evidence
+};
+
+struct DecisionRequest {
+    std::string model;         // "jev-latest" (System One) or "gpt-6-luna" (OpenAI)
+    DecisionInput input;
+    std::vector<DecisionQuestion> questions;
+};
+
+struct DecisionAnswer {
+    std::string name;                    // echoes the question name
+    std::string type;                    // "predicate", "choice", "score", "refusal"
+    std::optional<double> probability;   // predicate: P(condition is true)
+    std::optional<std::string> choice;   // choice: selected value
+    std::optional<double> score;         // score: probability-weighted average
+    std::vector<json> probabilities;     // choice/score: per-option distribution
+    std::optional<double> confidence;    // choice/score: confidence 0-1
+};
+
+struct DecisionResponse {
+    std::vector<DecisionAnswer> answers;
+    json raw;                            // raw provider response
+};
+
+enum class DecisionProvider { SystemOne, OpenAI };
+
 class Client {
 public:
     /**
@@ -51,10 +106,6 @@ public:
     Response PostMultipart(const std::string& endpoint, const std::map<std::string, std::string>& text_fields, const std::map<std::string, std::string>& file_fields);
     Response Delete(const std::string& endpoint);
     bool Download(const std::string& endpoint, const std::string& save_filepath);
-
-    // --- Decisions ---
-    // POST /decisions - Classify or score input with predicate/choice/score questions
-    json CreateDecision(const json& request_body);
 
     // --- Chat Completions (/chat/completions) ---
     json ChatCompletion(const std::vector<Message>& messages,
@@ -201,15 +252,29 @@ public:
                                 const json& request_body);
 
     // =====================================================================
-    // System One API (custom base URL / API key)
+    // Decisions - TypeSafe System One and OpenAI Decisions API
+    // Both providers return typed, structured decisions (choice/score/predicate)
+    // rather than generative text.
+    //   System One:  POST /v1/systemone   (TypeSafe, docs.typesafe.ai)
+    //   OpenAI:      POST /v1/decisions   (developers.openai.com)
     // =====================================================================
 
-    // POST /v1/chat/completions - System One chat completion
-    json CreateSystemOneChatCompletion(const json& request_body);
+    // Unified decision call across both providers.
+    DecisionResponse CreateDecision(const DecisionRequest& req,
+                                    DecisionProvider provider);
+
+    // Raw JSON passthrough for provider-specific request bodies.
+    json CreateDecision(const json& request_body);
+
+    // =====================================================================
+    // System One API (custom base URL / API key)
+    // Endpoint: POST /v1/systemone
+    // =====================================================================
+
+    // POST /v1/systemone - System One structured decision
+    json CreateSystemOneDecision(const json& request_body);
     // GET /v1/models - List System One models
     json ListSystemOneModels();
-    // POST /v1/embeddings - System One embeddings
-    json CreateSystemOneEmbeddings(const json& request_body);
 
     // =====================================================================
     // Anthropic Messages API
@@ -222,6 +287,9 @@ public:
     void SetAnthropicApiKey(const std::string& api_key) { std::lock_guard<std::mutex> lock(mutex_); anthropic_api_key_ = api_key; }
     void SetAnthropicBaseUrl(const std::string& base_url) { std::lock_guard<std::mutex> lock(mutex_); anthropic_base_url_ = base_url; }
     void SetAnthropicVersion(const std::string& version) { std::lock_guard<std::mutex> lock(mutex_); anthropic_version_ = version; }
+
+    void SetSystemOneApiKey(const std::string& api_key) { std::lock_guard<std::mutex> lock(mutex_); system_one_api_key_ = api_key; }
+    void SetSystemOneBaseUrl(const std::string& base_url) { std::lock_guard<std::mutex> lock(mutex_); system_one_base_url_ = base_url; }
 
     // POST /v1/messages - Create a message
     json CreateAnthropicMessage(const json& request_body);
