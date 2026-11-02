@@ -8,145 +8,254 @@
 #include <mutex>
 #include <future>
 
-#include <uv.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "libopenai/libopenai.hpp"
 #include "libopenai/transport.hpp"
+#include <nlohmann/json.hpp>
 
 using namespace libopenai;
 
-// Framing used by both NamedPipeTransport and UVPipeOpenAIServer:
-//   4-byte little-endian length prefix + JSON payload
 static constexpr char TEST_PIPE[] = "libopenai-integration-test-pipe";
-
-static void srv_alloc(uv_handle_t*, size_t suggested, uv_buf_t* buf) {
-    buf->base = new char[suggested];
-    buf->len = (unsigned int)suggested;
-}
 
 static uint32_t le32(const unsigned char* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
            ((uint32_t)p[3] << 24);
 }
 
-// Shared server state, reachable from callbacks via uv_handle_t->data.
-struct SrvCtx {
-    uv_pipe_t* client = nullptr;
-    std::string buf;
-    std::mutex mtx;
-    std::atomic<bool> full{false};
-};
-
-static void srv_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* b) {
-    auto* ctx = static_cast<SrvCtx*>(stream->data);
-    if (nread > 0) {
-        std::lock_guard<std::mutex> lock(ctx->mtx);
-        ctx->buf.append(b->base, (size_t)nread);
-        if (ctx->buf.size() >= 4) {
-            uint32_t len = le32((const unsigned char*)ctx->buf.data());
-            if (len > 0 && len <= 10 * 1024 * 1024 &&
-                ctx->buf.size() >= 4 + (size_t)len) {
-                ctx->full.store(true);
-            }
-        }
-    }
-    delete[] b->base;
-    if (nread < 0) {
-        uv_read_stop(stream);
-        uv_close(reinterpret_cast<uv_handle_t*>(stream), nullptr);
-    }
-}
-
-static void srv_connection(uv_stream_t* server, int status) {
-    if (status < 0) return;
-    auto* ctx = static_cast<SrvCtx*>(server->data);
-    if (uv_accept(server, reinterpret_cast<uv_stream_t*>(ctx->client)) != 0) return;
-    ctx->client->data = ctx;
-    uv_read_start(reinterpret_cast<uv_stream_t*>(ctx->client), srv_alloc, srv_read);
-    uv_read_stop(server); // one connection only
-}
-
-// Build a framed response buffer.
-static std::string make_frame(const std::string& json_payload) {
-    std::string frame;
-    uint32_t len = (uint32_t)json_payload.size();
-    frame.push_back((char)(len & 0xFF));
-    frame.push_back((char)((len >> 8) & 0xFF));
-    frame.push_back((char)((len >> 16) & 0xFF));
-    frame.push_back((char)((len >> 24) & 0xFF));
-    frame.append(json_payload);
-    return frame;
-}
-
-// Server thread: accepts one client, reads one framed JSON request, sends a
-// canned framed JSON response (same shape UVPipeOpenAIServer returns), then closes.
+// ------------------------------------------------------------------
+// Platform-native server: listens on a named pipe / Unix domain socket,
+// reads framed JSON requests, sends framed JSON responses echoing the
+// request ID. No libuv dependency.
+// ------------------------------------------------------------------
 static void run_server(std::atomic<bool>& ready, std::atomic<bool>& done) {
 #ifdef _WIN32
     std::string full_name = "\\\\.\\pipe\\" + std::string(TEST_PIPE);
-#else
-    std::string full_name = TEST_PIPE;
-    unlink(full_name.c_str());
-#endif
 
-    uv_loop_t* loop = uv_default_loop();
-    uv_pipe_t srv;
-    uv_pipe_t client;
-    // A listening named-pipe handle must use ipc=0 on Windows; uv_listen
-    // rejects ipc=1 handles with WSAEINVAL (see uv__pipe_listen).
-    uv_pipe_init(loop, &srv, 0);
-    uv_pipe_init(loop, &client, 1);
+    HANDLE hPipe = CreateNamedPipeA(
+        full_name.c_str(),
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        1, 4096, 4096, 0, nullptr);
 
-    SrvCtx ctx;
-    ctx.client = &client;
-    srv.data = &ctx;
-
-    int rc = uv_pipe_bind(&srv, full_name.c_str());
-    if (rc != 0) {
-        std::cerr << "[server] bind failed: " << uv_strerror(rc) << std::endl;
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        std::cerr << "[server] CreateNamedPipe failed: " << GetLastError() << std::endl;
         done.store(true);
         return;
     }
-    rc = uv_listen(reinterpret_cast<uv_stream_t*>(&srv), 16, srv_connection);
-    if (rc != 0) {
-        std::cerr << "[server] listen failed: " << uv_strerror(rc) << std::endl;
-        done.store(true);
-        return;
-    }
+
+    // Signal ready immediately after pipe creation (before blocking on ConnectNamedPipe)
     ready.store(true);
 
-    auto start = std::chrono::steady_clock::now();
-    while (!ctx.full.load() &&
-           std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < 10.0) {
-        uv_run(loop, UV_RUN_NOWAIT);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-
-    if (ctx.full.load()) {
-        // Canned success response mirroring UVPipeOpenAIServer's shape.
-        json jresp;
-        jresp["status_code"] = 200;
-        jresp["body"] = "{\"data\":[]}";
-        jresp["json_data"] = {{"object", "list"}, {"data", json::array()}};
-        std::string frame = make_frame(jresp.dump());
-
-        uv_write_t* req = new uv_write_t();
-        uv_buf_t buf = uv_buf_init((char*)frame.data(), (unsigned int)frame.size());
-        uv_write(req, reinterpret_cast<uv_stream_t*>(&client), &buf, 1,
-                 [](uv_write_t* r, int) { delete r; });
-
-        auto wstart = std::chrono::steady_clock::now();
-        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - wstart).count() < 1.0) {
-            uv_run(loop, UV_RUN_NOWAIT);
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!ConnectNamedPipe(hPipe, nullptr)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_PIPE_CONNECTED) {
+            std::cerr << "[server] ConnectNamedPipe failed: " << err << std::endl;
+            CloseHandle(hPipe);
+            done.store(true);
+            return;
         }
     }
 
-    uv_close(reinterpret_cast<uv_handle_t*>(&srv), nullptr);
+    // Read 4-byte length header
+    uint8_t header[4];
+    DWORD read = 0;
+    if (!ReadFile(hPipe, header, 4, &read, nullptr) || read != 4) {
+        std::cerr << "[server] Failed to read header" << std::endl;
+        CloseHandle(hPipe);
+        done.store(true);
+        return;
+    }
+
+    uint32_t msg_len = le32(header);
+    if (msg_len == 0 || msg_len > 10 * 1024 * 1024) {
+        std::cerr << "[server] Invalid message length: " << msg_len << std::endl;
+        CloseHandle(hPipe);
+        done.store(true);
+        return;
+    }
+
+    // Read JSON body
+    std::string body(msg_len, '\0');
+    if (!ReadFile(hPipe, &body[0], msg_len, &read, nullptr) || read != msg_len) {
+        std::cerr << "[server] Failed to read body" << std::endl;
+        CloseHandle(hPipe);
+        done.store(true);
+        return;
+    }
+
+    // Parse request to extract the request ID
+    uint64_t req_id = 0;
+    try {
+        auto jreq = json::parse(body);
+        req_id = jreq.value("id", static_cast<uint64_t>(0));
+    } catch (...) {
+        // Use default req_id = 0
+    }
+
+    std::cout << "[server] Received request id=" << req_id << std::endl;
+    std::cout.flush();
+
+    // Build response echoing the request ID
+    json jresp;
+    jresp["id"] = req_id;
+    jresp["status_code"] = 200;
+    jresp["body"] = "{\"data\":[]}";
+    jresp["json_data"] = {{"object", "list"}, {"data", json::array()}};
+
+    std::string response = jresp.dump();
+    uint32_t resp_len = static_cast<uint32_t>(response.size());
+    uint8_t resp_header[4];
+    resp_header[0] = static_cast<uint8_t>(resp_len & 0xFF);
+    resp_header[1] = static_cast<uint8_t>((resp_len >> 8) & 0xFF);
+    resp_header[2] = static_cast<uint8_t>((resp_len >> 16) & 0xFF);
+    resp_header[3] = static_cast<uint8_t>((resp_len >> 24) & 0xFF);
+
+    // Write response header + body
+    DWORD written = 0;
+    WriteFile(hPipe, resp_header, 4, &written, nullptr);
+    WriteFile(hPipe, response.data(), resp_len, &written, nullptr);
+
+    FlushFileBuffers(hPipe);
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(hPipe);
+
+#else
+    // Unix domain socket
+    std::string full_name = TEST_PIPE;
+    unlink(full_name.c_str());
+
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        std::cerr << "[server] socket() failed: " << strerror(errno) << std::endl;
+        done.store(true);
+        return;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, full_name.c_str(), sizeof(addr.sun_path) - 1);
+
+    if (bind(server_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "[server] bind() failed: " << strerror(errno) << std::endl;
+        close(server_fd);
+        done.store(true);
+        return;
+    }
+
+    if (listen(server_fd, 16) < 0) {
+        std::cerr << "[server] listen() failed: " << strerror(errno) << std::endl;
+        close(server_fd);
+        done.store(true);
+        return;
+    }
+
+    ready.store(true);
+
+    int client_fd = accept(server_fd, nullptr, nullptr);
+    if (client_fd < 0) {
+        std::cerr << "[server] accept() failed: " << strerror(errno) << std::endl;
+        close(server_fd);
+        done.store(true);
+        return;
+    }
+
+    // Read 4-byte length header
+    uint8_t header[4];
+    size_t total = 0;
+    while (total < 4) {
+        ssize_t n = recv(client_fd, reinterpret_cast<char*>(header + total), 4 - total, 0);
+        if (n <= 0) {
+            std::cerr << "[server] Failed to read header" << std::endl;
+            close(client_fd);
+            close(server_fd);
+            done.store(true);
+            return;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    uint32_t msg_len = le32(header);
+    if (msg_len == 0 || msg_len > 10 * 1024 * 1024) {
+        std::cerr << "[server] Invalid message length: " << msg_len << std::endl;
+        close(client_fd);
+        close(server_fd);
+        done.store(true);
+        return;
+    }
+
+    // Read JSON body
+    std::string body(msg_len, '\0');
+    total = 0;
+    while (total < msg_len) {
+        ssize_t n = recv(client_fd, &body[total], msg_len - total, 0);
+        if (n <= 0) {
+            std::cerr << "[server] Failed to read body" << std::endl;
+            close(client_fd);
+            close(server_fd);
+            done.store(true);
+            return;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    // Parse request to extract the request ID
+    uint64_t req_id = 0;
+    try {
+        auto jreq = json::parse(body);
+        req_id = jreq.value("id", static_cast<uint64_t>(0));
+    } catch (...) {
+        // Use default req_id = 0
+    }
+
+    std::cout << "[server] Received request id=" << req_id << std::endl;
+
+    // Build response echoing the request ID
+    json jresp;
+    jresp["id"] = req_id;
+    jresp["status_code"] = 200;
+    jresp["body"] = "{\"data\":[]}";
+    jresp["json_data"] = {{"object", "list"}, {"data", json::array()}};
+
+    std::string response = jresp.dump();
+    uint32_t resp_len = static_cast<uint32_t>(response.size());
+    uint8_t resp_header[4];
+    resp_header[0] = static_cast<uint8_t>(resp_len & 0xFF);
+    resp_header[1] = static_cast<uint8_t>((resp_len >> 8) & 0xFF);
+    resp_header[2] = static_cast<uint8_t>((resp_len >> 16) & 0xFF);
+    resp_header[3] = static_cast<uint8_t>((resp_len >> 24) & 0xFF);
+
+    // Write response header + body
+    total = 0;
+    while (total < 4) {
+        ssize_t n = send(client_fd, reinterpret_cast<const char*>(resp_header + total), 4 - total, 0);
+        if (n <= 0) break;
+        total += static_cast<size_t>(n);
+    }
+    total = 0;
+    while (total < resp_len) {
+        ssize_t n = send(client_fd, response.data() + total, resp_len - total, 0);
+        if (n <= 0) break;
+        total += static_cast<size_t>(n);
+    }
+
+    close(client_fd);
+    close(server_fd);
+    unlink(full_name.c_str());
+#endif
+
     done.store(true);
 }
 
 int main() {
-    std::cout << "=== NamedPipeTransport <-> pipe server integration test ===" << std::endl;
+    std::cout << "=== NamedPipeTransport end-to-end integration test ==="
+              << std::endl;
 
     std::atomic<bool> server_ready{false};
     std::atomic<bool> server_done{false};
@@ -154,18 +263,27 @@ int main() {
     std::thread server(run_server, std::ref(server_ready), std::ref(server_done));
 
     // Wait for server to start listening
-    for (int i = 0; i < 100 && !server_ready.load(); i++)
+    for (int i = 0; i < 500 && !server_ready.load(); i++)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    if (!server_ready.load()) {
+        std::cerr << "[client] Server failed to start" << std::endl;
+        return 1;
+    }
 
     bool test_passed = false;
     try {
         auto transport = CreateNamedPipeTransport(TEST_PIPE);
+        // Give the reader thread time to establish the connection
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         Client client("dummy-key", "http://localhost", transport);
 
         std::cout << "[client] transport: " << client.TransportName() << std::endl;
 
         // Issue a ListModels request over the named pipe.
+        std::cout << "[client] Calling ListModels()..." << std::endl;
         json result = client.ListModels();
+        std::cout << "[client] ListModels returned." << std::endl;
 
         if (!result.is_null() && result.contains("object") && result["object"] == "list") {
             test_passed = true;

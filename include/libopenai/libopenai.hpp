@@ -74,6 +74,10 @@ struct DecisionResponse {
 
 enum class DecisionProvider { SystemOne, OpenAI };
 
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
+
 class Client {
 public:
     /**
@@ -350,5 +354,9 @@ private:
                                   const std::map<std::string, std::string>& multipart_files = {},
                                   bool is_download = false, const std::string& download_path = "");
 };
+
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
 
 } // namespace libopenai

@@ -1,286 +1,304 @@
+/**
+ * IPC Benchmark: Named Pipe (platform-native) round-trip throughput
+ *
+ * Measures request/response round-trip throughput using the platform-native
+ * NamedPipeTransport over a named pipe / Unix domain socket.
+ *
+ * No libuv dependency.
+ */
+
 #include <iostream>
 #include <chrono>
 #include <thread>
 #include <atomic>
 #include <string>
-#include <vector>
 #include <cstring>
 #include <cstdint>
 
-#include <uv.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
-using namespace std::chrono;
+#include "libopenai/libopenai.hpp"
+#include "libopenai/transport.hpp"
 
-/**
- * IPC Benchmark: Named Pipe (uv_pipe_t) vs TCP Socket (localhost)
- *
- * Measures:
- * - Messages per second
- * - Latency per message (microseconds)
- * - Total data transferred
- */
+using namespace libopenai;
 
-constexpr size_t MESSAGE_SIZE = 1024;  // bytes per message
-constexpr size_t NUM_MESSAGES = 10000;
+constexpr size_t NUM_MESSAGES = 5000;
 constexpr char PIPE_NAME[] = "ipc-benchmark-pipe";
-constexpr int TCP_PORT = 19876;
 
-// Shared counter for coordination
-std::atomic<size_t> messages_received{0};
-std::atomic<bool> stop_benchmark{false};
-std::atomic<bool> server_ready{false};
-
-// ---------------------------------------------------------------
-// Named Pipe Server (libuv uv_pipe_t)
-// ---------------------------------------------------------------
-static void pipe_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-    buf->base = new char[suggested_size];
-    buf->len = static_cast<unsigned int>(suggested_size);
+static uint32_t le32(const unsigned char* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
 }
 
-static void pipe_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
-    if (nread > 0) {
-        messages_received.fetch_add(1);
-    }
-    delete[] buf->base;
-    if (nread < 0) {
-        uv_close(reinterpret_cast<uv_handle_t*>(stream), nullptr);
-    }
+static std::string make_frame(const std::string& json_payload) {
+    std::string frame;
+    uint32_t len = (uint32_t)json_payload.size();
+    frame.push_back((char)(len & 0xFF));
+    frame.push_back((char)((len >> 8) & 0xFF));
+    frame.push_back((char)((len >> 16) & 0xFF));
+    frame.push_back((char)((len >> 24) & 0xFF));
+    frame.append(json_payload);
+    return frame;
 }
 
-static void pipe_connection(uv_stream_t* server, int status) {
-    if (status < 0) return;
-    uv_pipe_t* client = new uv_pipe_t();
-    uv_pipe_init(uv_default_loop(), client, 1);
-    uv_accept(server, reinterpret_cast<uv_stream_t*>(client));
-    uv_read_start(reinterpret_cast<uv_stream_t*>(client), pipe_alloc, pipe_read);
-}
-
-static void run_pipe_server() {
+// ------------------------------------------------------------------
+// Platform-native echo server: accepts multiple sequential connections,
+// reads framed JSON requests on each, echoes back framed JSON responses
+// with the same request ID.
+// ------------------------------------------------------------------
+static void run_server(std::atomic<bool>& ready, std::atomic<bool>& stop) {
 #ifdef _WIN32
     std::string full_name = "\\\\.\\pipe\\" + std::string(PIPE_NAME);
+
+    HANDLE hPipe = CreateNamedPipeA(
+        full_name.c_str(),
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, nullptr);
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        std::cerr << "[server] CreateNamedPipe failed: " << GetLastError() << std::endl;
+        ready.store(true);
+        return;
+    }
+
+    // Signal ready immediately after pipe creation
+    ready.store(true);
+
+    while (!stop.load()) {
+        // Wait for a client to connect
+        if (!ConnectNamedPipe(hPipe, nullptr)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_PIPE_CONNECTED) {
+                break;
+            }
+        }
+
+        // Handle requests on this connection until client disconnects
+        while (!stop.load()) {
+            uint8_t header[4];
+            DWORD read = 0;
+            if (!ReadFile(hPipe, header, 4, &read, nullptr) || read != 4) break;
+
+            uint32_t msg_len = le32(header);
+            if (msg_len == 0 || msg_len > 10 * 1024 * 1024) break;
+
+            std::string body(msg_len, '\0');
+            if (!ReadFile(hPipe, &body[0], msg_len, &read, nullptr) || read != msg_len) break;
+
+            // Parse request ID
+            uint64_t req_id = 0;
+            try {
+                auto jreq = json::parse(body);
+                req_id = jreq.value("id", static_cast<uint64_t>(0));
+            } catch (...) {}
+
+            // Build echo response
+            json jresp;
+            jresp["id"] = req_id;
+            jresp["status_code"] = 200;
+            jresp["body"] = body;
+            jresp["json_data"] = {{"echo", true}};
+
+            std::string response = jresp.dump();
+            uint32_t resp_len = (uint32_t)response.size();
+            uint8_t resp_header[4];
+            resp_header[0] = (uint8_t)(resp_len & 0xFF);
+            resp_header[1] = (uint8_t)((resp_len >> 8) & 0xFF);
+            resp_header[2] = (uint8_t)((resp_len >> 16) & 0xFF);
+            resp_header[3] = (uint8_t)((resp_len >> 24) & 0xFF);
+
+            DWORD written = 0;
+            WriteFile(hPipe, resp_header, 4, &written, nullptr);
+            WriteFile(hPipe, response.data(), resp_len, &written, nullptr);
+            FlushFileBuffers(hPipe);
+        }
+
+        // Client disconnected; prepare for next connection
+        DisconnectNamedPipe(hPipe);
+    }
+
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(hPipe);
 #else
     std::string full_name = PIPE_NAME;
     unlink(full_name.c_str());
-#endif
 
-    uv_pipe_t srv;
-    // A listening named-pipe handle must use ipc=0 on Windows;
-    // uv_listen rejects ipc=1 handles with WSAEINVAL.
-    uv_pipe_init(uv_default_loop(), &srv, 0);
-    uv_pipe_bind(&srv, full_name.c_str());
-    uv_listen(reinterpret_cast<uv_stream_t*>(&srv), 128, pipe_connection);
-
-    server_ready.store(true);
-
-    while (!stop_benchmark.load()) {
-        uv_run(uv_default_loop(), UV_RUN_NOWAIT);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        std::cerr << "[server] socket() failed: " << strerror(errno) << std::endl;
+        ready.store(true);
+        return;
     }
 
-    uv_close(reinterpret_cast<uv_handle_t*>(&srv), nullptr);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, full_name.c_str(), sizeof(addr.sun_path) - 1);
+
+    if (bind(server_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "[server] bind() failed: " << strerror(errno) << std::endl;
+        close(server_fd);
+        ready.store(true);
+        return;
+    }
+
+    if (listen(server_fd, 16) < 0) {
+        std::cerr << "[server] listen() failed: " << strerror(errno) << std::endl;
+        close(server_fd);
+        ready.store(true);
+        return;
+    }
+
+    ready.store(true);
+
+    while (!stop.load()) {
+        int client_fd = accept(server_fd, nullptr, nullptr);
+        if (client_fd < 0) break;
+
+        // Handle requests on this connection until client disconnects
+        while (!stop.load()) {
+            uint8_t header[4];
+            size_t total = 0;
+            while (total < 4) {
+                ssize_t n = recv(client_fd, reinterpret_cast<char*>(header + total), 4 - total, 0);
+                if (n <= 0) goto client_done;
+                total += static_cast<size_t>(n);
+            }
+
+            uint32_t msg_len = le32(header);
+            if (msg_len == 0 || msg_len > 10 * 1024 * 1024) break;
+
+            std::string body(msg_len, '\0');
+            total = 0;
+            while (total < msg_len) {
+                ssize_t n = recv(client_fd, &body[total], msg_len - total, 0);
+                if (n <= 0) goto client_done;
+                total += static_cast<size_t>(n);
+            }
+
+            // Parse request ID
+            uint64_t req_id = 0;
+            try {
+                auto jreq = json::parse(body);
+                req_id = jreq.value("id", static_cast<uint64_t>(0));
+            } catch (...) {}
+
+            // Build echo response
+            json jresp;
+            jresp["id"] = req_id;
+            jresp["status_code"] = 200;
+            jresp["body"] = body;
+            jresp["json_data"] = {{"echo", true}};
+
+            std::string response = jresp.dump();
+            uint32_t resp_len = (uint32_t)response.size();
+            uint8_t resp_header[4];
+            resp_header[0] = (uint8_t)(resp_len & 0xFF);
+            resp_header[1] = (uint8_t)((resp_len >> 8) & 0xFF);
+            resp_header[2] = (uint8_t)((resp_len >> 16) & 0xFF);
+            resp_header[3] = (uint8_t)((resp_len >> 24) & 0xFF);
+
+            total = 0;
+            while (total < 4) {
+                ssize_t n = send(client_fd, reinterpret_cast<const char*>(resp_header + total), 4 - total, 0);
+                if (n <= 0) goto client_done;
+                total += static_cast<size_t>(n);
+            }
+            total = 0;
+            while (total < resp_len) {
+                ssize_t n = send(client_fd, response.data() + total, resp_len - total, 0);
+                if (n <= 0) goto client_done;
+                total += static_cast<size_t>(n);
+            }
+        }
+
+client_done:
+        close(client_fd);
+    }
+
+    close(server_fd);
+    unlink(full_name.c_str());
+#endif
 }
 
-// ---------------------------------------------------------------
-// Named Pipe Client
-// ---------------------------------------------------------------
-static void run_pipe_client() {
+int main() {
+    std::cout << "IPC Benchmark: Named Pipe round-trip (platform-native)" << std::endl;
+    std::cout << "=====================================================" << std::endl;
+
+    std::atomic<bool> ready{false};
+    std::atomic<bool> stop{false};
+
+    std::thread server_thread(run_server, std::ref(ready), std::ref(stop));
+
     // Wait for server
-    while (!server_ready.load()) {
+    while (!ready.load() && !stop.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-#ifdef _WIN32
-    std::string full_name = "\\\\.\\pipe\\" + std::string(PIPE_NAME);
-#else
-    std::string full_name = PIPE_NAME;
-#endif
+    try {
+        auto transport = CreateNamedPipeTransport(PIPE_NAME);
 
-    uv_pipe_t pipe;
-    uv_loop_t* client_loop = uv_loop_new();
-    uv_pipe_init(client_loop, &pipe, 1);
+        // Warm-up request
+        {
+            Request req;
+            req.method = "POST";
+            req.url = "http://localhost";
+            req.endpoint = "/bench";
+            req.headers["Content-Type"] = "application/json";
+            req.payload = "{\"seq\":0}";
+            req.timeout_seconds = 10;
+            auto resp = transport->Execute(req);
+            std::cout << "[warm-up] status=" << resp.status_code << std::endl;
+        }
 
-    uv_connect_t* connect_req = new uv_connect_t();
-    uv_pipe_connect(connect_req, &pipe, full_name.c_str(), [](uv_connect_t*, int) {});
+        // Sequential benchmark
+        std::string payload(256, 'X');
+        auto start = std::chrono::high_resolution_clock::now();
 
-    // Run event loop to complete connection
-    uv_run(client_loop, UV_RUN_NOWAIT);
+        size_t successes = 0;
+        for (size_t i = 0; i < NUM_MESSAGES; i++) {
+            Request req;
+            req.method = "POST";
+            req.url = "http://localhost";
+            req.endpoint = "/bench";
+            req.headers["Content-Type"] = "application/json";
+            json body;
+            body["seq"] = (int)i;
+            body["data"] = payload;
+            req.payload = body.dump();
+            req.timeout_seconds = 10;
 
-    // Create message buffer
-    std::string message(MESSAGE_SIZE, 'X');
+            auto resp = transport->Execute(req);
+            if (resp.status_code == 200) successes++;
+        }
 
-    auto start = high_resolution_clock::now();
+        auto end = std::chrono::high_resolution_clock::now();
+        double elapsed_sec = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000000.0;
 
-    for (size_t i = 0; i < NUM_MESSAGES && !stop_benchmark.load(); i++) {
-        uv_write_t* req = new uv_write_t();
-        uv_buf_t buf = uv_buf_init(const_cast<char*>(message.data()), static_cast<unsigned int>(message.size()));
-        uv_write(req, reinterpret_cast<uv_stream_t*>(&pipe), &buf, 1, [](uv_write_t* req, int) {
-            delete req;
-        });
+        std::cout << "\n=== Results ===" << std::endl;
+        std::cout << "Messages: " << NUM_MESSAGES << std::endl;
+        std::cout << "Successes: " << successes << std::endl;
+        std::cout << "Elapsed: " << elapsed_sec << " seconds" << std::endl;
+        std::cout << "Round-trips/sec: " << (NUM_MESSAGES / elapsed_sec) << std::endl;
+        std::cout << "Avg latency: " << (elapsed_sec * 1000000.0 / NUM_MESSAGES) << " microseconds" << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "[client] exception: " << e.what() << std::endl;
+        stop.store(true);
+        server_thread.join();
+        return 1;
     }
 
-    // Wait for all messages to be processed
-    while (messages_received.load() < NUM_MESSAGES && !stop_benchmark.load()) {
-        uv_run(client_loop, UV_RUN_NOWAIT);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    auto end = high_resolution_clock::now();
-
-    double elapsed_sec = duration_cast<microseconds>(end - start).count() / 1000000.0;
-    double msgs_per_sec = NUM_MESSAGES / elapsed_sec;
-    double latency_us = (elapsed_sec * 1000000.0) / NUM_MESSAGES;
-    double mb_per_sec = (NUM_MESSAGES * MESSAGE_SIZE) / (1024.0 * 1024.0 * elapsed_sec);
-
-    std::cout << "\n=== Named Pipe Benchmark ===" << std::endl;
-    std::cout << "Messages: " << NUM_MESSAGES << std::endl;
-    std::cout << "Message size: " << MESSAGE_SIZE << " bytes" << std::endl;
-    std::cout << "Elapsed: " << elapsed_sec << " seconds" << std::endl;
-    std::cout << "Messages/sec: " << msgs_per_sec << std::endl;
-    std::cout << "Avg latency: " << latency_us << " microseconds" << std::endl;
-    std::cout << "Throughput: " << mb_per_sec << " MB/sec" << std::endl;
-
-    // Drain the client loop so the close completes, then tear it down.
-    uv_run(client_loop, UV_RUN_NOWAIT);
-    uv_close(reinterpret_cast<uv_handle_t*>(&pipe), nullptr);
-    uv_run(client_loop, UV_RUN_NOWAIT);
-    uv_loop_close(client_loop);
-    uv_loop_delete(client_loop);
-}
-
-// ---------------------------------------------------------------
-// TCP Server
-// ---------------------------------------------------------------
-static std::atomic<size_t> tcp_messages_received{0};
-
-static void tcp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-    buf->base = new char[suggested_size];
-    buf->len = static_cast<unsigned int>(suggested_size);
-}
-
-static void tcp_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
-    if (nread > 0) {
-        tcp_messages_received.fetch_add(1);
-    }
-    delete[] buf->base;
-    if (nread < 0) {
-        uv_close(reinterpret_cast<uv_handle_t*>(stream), nullptr);
-    }
-}
-
-static void tcp_connection(uv_stream_t* server, int status) {
-    if (status < 0) return;
-    uv_tcp_t* client = new uv_tcp_t();
-    uv_tcp_init(uv_default_loop(), client);
-    uv_accept(server, reinterpret_cast<uv_stream_t*>(client));
-    uv_read_start(reinterpret_cast<uv_stream_t*>(client), tcp_alloc, tcp_read);
-}
-
-static void run_tcp_server() {
-    uv_tcp_t srv;
-    uv_tcp_init(uv_default_loop(), &srv);
-
-    struct sockaddr_in addr;
-    uv_ip4_addr("127.0.0.1", TCP_PORT, &addr);
-    uv_tcp_bind(&srv, reinterpret_cast<const struct sockaddr*>(&addr), 0);
-    uv_listen(reinterpret_cast<uv_stream_t*>(&srv), 128, tcp_connection);
-
-    while (!stop_benchmark.load()) {
-        uv_run(uv_default_loop(), UV_RUN_NOWAIT);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    uv_close(reinterpret_cast<uv_handle_t*>(&srv), nullptr);
-}
-
-// ---------------------------------------------------------------
-// TCP Client
-// ---------------------------------------------------------------
-static void run_tcp_client() {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    uv_tcp_t sock;
-    uv_tcp_init(uv_default_loop(), &sock);
-
-    struct sockaddr_in addr;
-    uv_ip4_addr("127.0.0.1", TCP_PORT, &addr);
-
-    uv_connect_t* connect_req = new uv_connect_t();
-    uv_tcp_connect(connect_req, &sock, reinterpret_cast<const struct sockaddr*>(&addr),
-                   [](uv_connect_t* req, int status) {
-                       delete req;
-                   });
-
-    uv_run(uv_default_loop(), UV_RUN_NOWAIT);
-
-    std::string message(MESSAGE_SIZE, 'Y');
-
-    auto start = high_resolution_clock::now();
-
-    for (size_t i = 0; i < NUM_MESSAGES && !stop_benchmark.load(); i++) {
-        uv_write_t* req = new uv_write_t();
-        uv_buf_t buf = uv_buf_init(const_cast<char*>(message.data()), static_cast<unsigned int>(message.size()));
-        uv_write(req, reinterpret_cast<uv_stream_t*>(&sock), &buf, 1, [](uv_write_t* req, int) {
-            delete req;
-        });
-    }
-
-    while (tcp_messages_received.load() < NUM_MESSAGES && !stop_benchmark.load()) {
-        uv_run(uv_default_loop(), UV_RUN_NOWAIT);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    auto end = high_resolution_clock::now();
-
-    double elapsed_sec = duration_cast<microseconds>(end - start).count() / 1000000.0;
-    double msgs_per_sec = NUM_MESSAGES / elapsed_sec;
-    double latency_us = (elapsed_sec * 1000000.0) / NUM_MESSAGES;
-    double mb_per_sec = (NUM_MESSAGES * MESSAGE_SIZE) / (1024.0 * 1024.0 * elapsed_sec);
-
-    std::cout << "\n=== TCP Socket Benchmark ===" << std::endl;
-    std::cout << "Messages: " << NUM_MESSAGES << std::endl;
-    std::cout << "Message size: " << MESSAGE_SIZE << " bytes" << std::endl;
-    std::cout << "Elapsed: " << elapsed_sec << " seconds" << std::endl;
-    std::cout << "Messages/sec: " << msgs_per_sec << std::endl;
-    std::cout << "Avg latency: " << latency_us << " microseconds" << std::endl;
-    std::cout << "Throughput: " << mb_per_sec << " MB/sec" << std::endl;
-
-    uv_close(reinterpret_cast<uv_handle_t*>(&sock), nullptr);
-}
-
-int main() {
-    std::cout << "IPC Benchmark: Named Pipe vs TCP Socket" << std::endl;
-    std::cout << "========================================" << std::endl;
-
-    // Run named pipe benchmark
-    {
-        messages_received.store(0);
-        stop_benchmark.store(false);
-        server_ready.store(false);
-
-        std::thread pipe_server(run_pipe_server);
-        std::thread pipe_client(run_pipe_client);
-
-        pipe_client.join();
-        stop_benchmark.store(true);
-        pipe_server.join();
-    }
-
-    // Reset for TCP benchmark
-    {
-        tcp_messages_received.store(0);
-        stop_benchmark.store(false);
-        server_ready.store(false);
-
-        std::thread tcp_server(run_tcp_server);
-        std::thread tcp_client(run_tcp_client);
-
-        tcp_client.join();
-        stop_benchmark.store(true);
-        tcp_server.join();
-    }
+    stop.store(true);
+    server_thread.join();
 
     std::cout << "\nBenchmark complete." << std::endl;
     return 0;

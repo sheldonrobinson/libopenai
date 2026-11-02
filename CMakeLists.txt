@@ -19,10 +19,15 @@ set(LIBOPENAI_TRANSPORT_BACKEND "httplib" CACHE STRING
 set(LIBOPENAI_USE_CURL OFF CACHE BOOL "Enable libcurl transport backend")
 set(LIBOPENAI_USE_MONGOOSE OFF CACHE BOOL "Enable mongoose transport backend")
 set(LIBOPENAI_USE_CIVETWEB OFF CACHE BOOL "Enable civetweb transport backend")
-set(LIBOPENAI_USE_NAMED_PIPE OFF CACHE BOOL "Enable libuv named pipe transport backend")
+set(LIBOPENAI_USE_LIBHTTP OFF CACHE BOOL "Enable libhttp (mongoose fork) transport backend")
+set(LIBOPENAI_USE_SEASTAR OFF CACHE BOOL "Enable seastar (ScyllaDB framework) transport backend")
+set(LIBOPENAI_USE_PROXYGEN OFF CACHE BOOL "Enable proxygen (Meta HTTP library) transport backend")
+set(LIBOPENAI_USE_NAMED_PIPE OFF CACHE BOOL "Enable platform-native named pipe transport backend")
+set(LIBOPENAI_USE_IN_MEMORY OFF CACHE BOOL "Enable pure C++ in-memory socketless transport backend")
 set(LIBOPENAI_USE_BEAST OFF CACHE BOOL "Enable Boost.Beast transport backend")
 set(LIBOPENAI_USE_WORKFLOW OFF CACHE BOOL "Enable C++ Workflow transport backend")
 set(LIBOPENAI_USE_CPPSERVER OFF CACHE BOOL "Enable CppServer transport backend")
+set(LIBOPENAI_USE_IO_URING OFF CACHE BOOL "Enable Linux io_uring async I/O for named-pipe (Unix domain sockets)")
 
 if(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "curl")
     set(LIBOPENAI_USE_CURL ON)
@@ -30,8 +35,16 @@ elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "mongoose")
     set(LIBOPENAI_USE_MONGOOSE ON)
 elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "civetweb")
     set(LIBOPENAI_USE_CIVETWEB ON)
+elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "libhttp")
+    set(LIBOPENAI_USE_LIBHTTP ON)
+elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "seastar")
+    set(LIBOPENAI_USE_SEASTAR ON)
+elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "proxygen")
+    set(LIBOPENAI_USE_PROXYGEN ON)
 elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "named-pipe")
     set(LIBOPENAI_USE_NAMED_PIPE ON)
+elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "in-memory")
+    set(LIBOPENAI_USE_IN_MEMORY ON)
 elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "beast")
     set(LIBOPENAI_USE_BEAST ON)
 elseif(LIBOPENAI_TRANSPORT_BACKEND STREQUAL "workflow")
@@ -54,7 +67,7 @@ if(NOT nlohmann_json_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
-# cpp-httplib (default backend)
+# cpp-httplib (default backend only)
 # ---------------------------------------------------------------------------
 find_package(httplib QUIET)
 if(NOT httplib_FOUND)
@@ -103,17 +116,45 @@ if(LIBOPENAI_USE_CIVETWEB)
 endif()
 
 # ---------------------------------------------------------------------------
-# libuv (named pipe backend)
+# libhttp (mongoose fork, MIT license)
 # ---------------------------------------------------------------------------
-if(LIBOPENAI_USE_NAMED_PIPE)
+if(LIBOPENAI_USE_LIBHTTP)
   FetchContent_Declare(
-    libuv
-    GIT_REPOSITORY https://github.com/libuv/libuv.git
-    GIT_TAG origin/v1.x
+    libhttp
+    GIT_REPOSITORY https://github.com/lammertb/libhttp.git
+    GIT_TAG origin/master
     GIT_SHALLOW TRUE
   )
-  FetchContent_MakeAvailable(libuv)
-  add_compile_definitions(LIBOPENAI_USE_NAMED_PIPE)
+  FetchContent_MakeAvailable(libhttp)
+  add_compile_definitions(LIBOPENAI_USE_LIBHTTP)
+endif()
+
+# ---------------------------------------------------------------------------
+# seastar (ScyllaDB high-performance server framework)
+# ---------------------------------------------------------------------------
+if(LIBOPENAI_USE_SEASTAR)
+  FetchContent_Declare(
+    seastar
+    GIT_REPOSITORY https://github.com/scylladb/seastar.git
+    GIT_TAG origin/master
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(seastar)
+  add_compile_definitions(LIBOPENAI_USE_SEASTAR)
+endif()
+
+# ---------------------------------------------------------------------------
+# proxygen (Meta HTTP library)
+# ---------------------------------------------------------------------------
+if(LIBOPENAI_USE_PROXYGEN)
+  FetchContent_Declare(
+    proxygen
+    GIT_REPOSITORY https://github.com/meta/proxygen.git
+    GIT_TAG origin/master
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(proxygen)
+  add_compile_definitions(LIBOPENAI_USE_PROXYGEN)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -153,11 +194,35 @@ if(LIBOPENAI_USE_CPPSERVER)
 endif()
 
 # ---------------------------------------------------------------------------
+# liburing (Linux io_uring async I/O for named-pipe)
+# ---------------------------------------------------------------------------
+if(LIBOPENAI_USE_IO_URING)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "LIBOPENAI_USE_IO_URING requires Linux")
+  endif()
+  FetchContent_Declare(
+    liburing
+    GIT_REPOSITORY https://github.com/axboe/liburing.git
+    GIT_TAG origin/master
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(liburing)
+  add_compile_definitions(LIBOPENAI_USE_IO_URING)
+endif()
+
+# ---------------------------------------------------------------------------
 # Library sources
 # ---------------------------------------------------------------------------
 add_library(libopenai STATIC
   src/libopenai.cpp
   src/transports/httplib_transport.cpp
+  src/inference_backend.cpp
+  src/inference_provider.cpp
+  src/provider_registry.cpp
+  src/modality_router.cpp
+  src/device_cloud_router.cpp
+  src/cluster_backend.cpp
+  src/inference_client.cpp
 )
 
 target_include_directories(libopenai PUBLIC
@@ -189,7 +254,34 @@ endif()
 
 if(LIBOPENAI_USE_NAMED_PIPE)
   target_sources(libopenai PRIVATE src/transports/namedpipe_transport.cpp)
-  target_link_libraries(libopenai PUBLIC uv)
+  add_compile_definitions(LIBOPENAI_USE_NAMED_PIPE)
+  # Platform-native APIs: no external library dependency
+endif()
+
+if(LIBOPENAI_USE_IO_URING)
+  target_sources(libopenai PRIVATE src/transports/namedpipe_transport.cpp)
+  target_link_libraries(libopenai PUBLIC liburing::liburing)
+endif()
+
+if(LIBOPENAI_USE_IN_MEMORY)
+  target_sources(libopenai PRIVATE src/transports/inmemory_transport.cpp)
+  add_compile_definitions(LIBOPENAI_USE_IN_MEMORY)
+  # Pure C++17: no external library dependency
+endif()
+
+if(LIBOPENAI_USE_LIBHTTP)
+  target_sources(libopenai PRIVATE src/transports/libhttp_transport.cpp)
+  target_link_libraries(libopenai PUBLIC libhttp::libhttp)
+endif()
+
+if(LIBOPENAI_USE_SEASTAR)
+  target_sources(libopenai PRIVATE src/transports/seastar_transport.cpp)
+  target_link_libraries(libopenai PUBLIC seastar::seastar)
+endif()
+
+if(LIBOPENAI_USE_PROXYGEN)
+  target_sources(libopenai PRIVATE src/transports/proxygen_transport.cpp)
+  target_link_libraries(libopenai PUBLIC proxygen::proxygen)
 endif()
 
 if(LIBOPENAI_USE_BEAST)
@@ -220,14 +312,25 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/namedpipe_example.cpp")
   target_link_libraries(example_namedpipe PRIVATE libopenai)
 endif()
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/ipc_benchmark.cpp" AND LIBOPENAI_USE_NAMED_PIPE)
-  add_executable(ipc_benchmark examples/ipc_benchmark.cpp)
-  target_link_libraries(ipc_benchmark PRIVATE uv)
-  target_include_directories(ipc_benchmark PRIVATE ${libuv_SOURCE_DIR}/include)
-endif()
-
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/namedpipe_integration_test.cpp" AND LIBOPENAI_USE_NAMED_PIPE)
   add_executable(namedpipe_integration_test examples/namedpipe_integration_test.cpp)
   target_link_libraries(namedpipe_integration_test PRIVATE libopenai)
-  target_include_directories(namedpipe_integration_test PRIVATE ${libuv_SOURCE_DIR}/include)
+  target_compile_definitions(namedpipe_integration_test PRIVATE LIBOPENAI_USE_NAMED_PIPE)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/ipc_benchmark.cpp" AND LIBOPENAI_USE_NAMED_PIPE)
+  add_executable(ipc_benchmark examples/ipc_benchmark.cpp)
+  target_link_libraries(ipc_benchmark PRIVATE libopenai)
+  target_compile_definitions(ipc_benchmark PRIVATE LIBOPENAI_USE_NAMED_PIPE)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/inference_frontend_example.cpp")
+  add_executable(inference_frontend_example examples/inference_frontend_example.cpp)
+  target_link_libraries(inference_frontend_example PRIVATE libopenai)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/inmemory_example.cpp" AND LIBOPENAI_USE_IN_MEMORY)
+  add_executable(inmemory_example examples/inmemory_example.cpp)
+  target_link_libraries(inmemory_example PRIVATE libopenai)
+  target_compile_definitions(inmemory_example PRIVATE LIBOPENAI_USE_IN_MEMORY)
 endif()

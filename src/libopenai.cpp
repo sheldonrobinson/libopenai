@@ -1,3 +1,7 @@
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
+
 #include "libopenai/libopenai.hpp"
 
 #ifdef DeleteFile
@@ -497,6 +501,10 @@ json Client::UploadFile(const std::string& filepath, const std::string& purpose)
     Response resp = PostMultipart("/files", texts, files);
     return resp.json_data.is_null() ? json{{"status", resp.status_code}, {"body", resp.body}} : resp.json_data;
 }
+
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
 
 json Client::DeleteFile(const std::string& file_id) {
     Response resp = Delete("/files/" + file_id);
